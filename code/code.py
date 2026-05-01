@@ -1,105 +1,183 @@
-import os
 import datetime
+import logging
+import os
+from dataclasses import dataclass
+
 from celery import Celery
-from sqlalchemy import create_engine, Column, Integer, String, DateTime
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, create_engine
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
-# Architecture Initialization: Message Broker and Database Config
-DATABASE_URI = os.getenv('PROD_DATABASE_URL', 'sqlite:///sers_local.db')
-REDIS_BROKER = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
+# Architecture initialization: message broker and database configuration
+DATABASE_URI = os.getenv("PROD_DATABASE_URL", "sqlite:///sers_local.db")
+REDIS_BROKER = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
 
-app_celery = Celery('sers_async_worker', broker=REDIS_BROKER)
-app_celery.conf.timezone = 'UTC'
+app_celery = Celery("sers_async_worker", broker=REDIS_BROKER)
+app_celery.conf.timezone = "UTC"
 
 engine = create_engine(DATABASE_URI)
 Base = declarative_base()
 Session = sessionmaker(bind=engine)
 
-# Model Layer: Data encapsulation mapping to the UML Class Diagram
-class EventEntity(Base):
-    __tablename__ = 'scheduled_events'
+logger = logging.getLogger("sers.notification")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+
+class ReminderStatus:
+    PENDING = "Pending"
+    DISPATCHED = "Dispatched"
+    FAILED = "Failed"
+    CANCELLED = "Cancelled"
+
+
+@dataclass
+class EventPayload:
+    title: str
+    description: str
+    location: str
+    event_timestamp: datetime.datetime
+    target_email: str
+    offset_minutes: int
+    user_id: int
+
+    def validate(self, current_time):
+        if not self.title.strip() or not self.target_email.strip():
+            raise ValueError("Title and target_email are mandatory fields.")
+        if self.offset_minutes < 0:
+            raise ValueError("offset_minutes must be a non-negative integer.")
+        if self.event_timestamp <= current_time:
+            raise ValueError("Scheduled events must occur in the future.")
+
+
+# Model layer: entities mapped from the UML class design
+class UserEntity(Base):
+    __tablename__ = "users"
+
     id = Column(Integer, primary_key=True)
+    username = Column(String(120), nullable=False)
+    email = Column(String(150), nullable=False, unique=True)
+    password_hash = Column(String(255), nullable=False)
+
+    events = relationship("EventEntity", back_populates="user", cascade="all, delete-orphan")
+
+
+class EventEntity(Base):
+    __tablename__ = "scheduled_events"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     title = Column(String(150), nullable=False)
+    description = Column(Text, nullable=False, default="")
+    location = Column(String(150), nullable=False, default="")
     event_timestamp = Column(DateTime, nullable=False)
     target_email = Column(String(150), nullable=False)
-    async_task_id = Column(String(100)) # Stores Celery ID for revocation
+
+    user = relationship("UserEntity", back_populates="events")
+    reminders = relationship("ReminderEntity", back_populates="event", cascade="all, delete-orphan")
+
+
+class ReminderEntity(Base):
+    __tablename__ = "reminders"
+
+    id = Column(Integer, primary_key=True)
+    event_id = Column(Integer, ForeignKey("scheduled_events.id"), nullable=False)
+    trigger_offset = Column(Integer, nullable=False)
+    status = Column(String(20), nullable=False, default=ReminderStatus.PENDING)
+    celery_task_id = Column(String(100), nullable=True)
+
+    event = relationship("EventEntity", back_populates="reminders")
+
 
 Base.metadata.create_all(engine)
 
-# Asynchronous Worker Layer: Executed completely independent of the web server
-@app_celery.task(name='notification.dispatch', bind=True)
-def dispatch_reminder_alert(self, entity_id, target_email, event_title):
-    """
-    Background worker simulating external SMTP connection.
-    This function blocks its own thread, but does not block the web server.
-    """
+
+# Asynchronous worker layer: runs independently from the web server
+@app_celery.task(name="notification.dispatch", bind=True)
+def dispatch_reminder_alert(self, reminder_id, target_email, event_title):
+    """Background worker that simulates sending reminder notifications."""
     try:
-        alert_payload = f"Automated Reminder: '{event_title}' is approaching."
-        
-        # System logging to verify successful delivery for administrative review
-        log_entry = f"[{datetime.datetime.utcnow().isoformat()}] SUCCESS -> {target_email} | Payload: {alert_payload}\n"
-        with open("system_delivery_logs.txt", "a") as file_handle:
-            file_handle.write(log_entry)
-            
-        return {"execution_status": "success", "entity_id": entity_id}
+        alert_payload = "Automated Reminder: '{}' is approaching.".format(event_title)
+        logger.info("SUCCESS reminder_id=%s target=%s payload=%s", reminder_id, target_email, alert_payload)
+        return {"execution_status": "success", "reminder_id": reminder_id}
     except Exception as runtime_error:
+        logger.exception("FAILED reminder_id=%s target=%s", reminder_id, target_email)
         return {"execution_status": "failed", "error_trace": str(runtime_error)}
 
-# Controller Layer: Orchestrates Model updates and Broker dispatch
+
+# Controller layer: orchestrates model persistence and broker dispatch
 class SersController:
     def __init__(self):
         self.db_session = Session()
 
-    def schedule_new_event(self, title, event_timestamp, target_email, offset_minutes):
-        """
-        Validates input, persists the Model, calculates temporal offsets,
-        and pushes the payload to the Redis broker.
-        """
-        # Primary logical validation
-        if not title or not target_email:
-            raise ValueError("Data Validation Failure: Title and Email are mandatory parameters.")
-            
-        current_system_time = datetime.datetime.utcnow()
-        if event_timestamp <= current_system_time:
-            raise ValueError("Temporal Logic Failure: Scheduled events must occur in the future.")
+    def _calculate_trigger_time(self, event_timestamp, offset_minutes, current_time):
+        calculated_trigger = event_timestamp - datetime.timedelta(minutes=offset_minutes)
+        if calculated_trigger < current_time:
+            return current_time + datetime.timedelta(seconds=5)
+        return calculated_trigger
 
-        # 1. Persist the Model state
+    def _dispatch_to_broker(self, reminder_id, target_email, event_title, trigger_time):
+        return dispatch_reminder_alert.apply_async(
+            args=[reminder_id, target_email, event_title],
+            eta=trigger_time,
+        )
+
+    def schedule_new_event(self, payload):
+        """Persist event data and schedule a Celery task for deferred delivery."""
+        current_system_time = datetime.datetime.utcnow()
+        payload.validate(current_system_time)
+
         new_event = EventEntity(
-            title=title,
-            event_timestamp=event_timestamp,
-            target_email=target_email
+            user_id=payload.user_id,
+            title=payload.title,
+            description=payload.description,
+            location=payload.location,
+            event_timestamp=payload.event_timestamp,
+            target_email=payload.target_email,
         )
         self.db_session.add(new_event)
-        self.db_session.commit()
+        self.db_session.flush()
 
-        # 2. Calculate precise temporal trigger offset
-        calculated_trigger = event_timestamp - datetime.timedelta(minutes=offset_minutes)
-        if calculated_trigger < current_system_time:
-            # Fallback mechanism if offset pushes trigger into the past
-            calculated_trigger = current_system_time + datetime.timedelta(seconds=5)
+        reminder = ReminderEntity(
+            event_id=new_event.id,
+            trigger_offset=payload.offset_minutes,
+            status=ReminderStatus.PENDING,
+        )
+        self.db_session.add(reminder)
+        self.db_session.flush()
 
-        # 3. Dispatch the payload to the asynchronous broker
-        dispatched_task = dispatch_reminder_alert.apply_async(
-            args=[new_event.id, new_event.target_email, new_event.title],
-            eta=calculated_trigger
+        trigger_time = self._calculate_trigger_time(
+            event_timestamp=payload.event_timestamp,
+            offset_minutes=payload.offset_minutes,
+            current_time=current_system_time,
+        )
+        dispatched_task = self._dispatch_to_broker(
+            reminder_id=reminder.id,
+            target_email=payload.target_email,
+            event_title=payload.title,
+            trigger_time=trigger_time,
         )
 
-        # 4. Update Model with task identifier to allow future revocation
-        new_event.async_task_id = dispatched_task.id
+        reminder.celery_task_id = dispatched_task.id
         self.db_session.commit()
-
         return new_event.id
 
     def revoke_existing_event(self, entity_id):
-        """
-        Removes the Model entity and aggressively terminates the pending asynchronous task.
-        """
+        """Delete an event and revoke its scheduled asynchronous reminder task."""
         target_event = self.db_session.query(EventEntity).filter_by(id=entity_id).first()
-        if target_event:
-            if target_event.async_task_id:
-                # Intercept the message broker to prevent misfire of canceled events
-                app_celery.control.revoke(target_event.async_task_id, terminate=True)
-            self.db_session.delete(target_event)
-            self.db_session.commit()
-            return True
-        return False
+        if not target_event:
+            return False
+
+        for reminder in target_event.reminders:
+            if reminder.celery_task_id:
+                app_celery.control.revoke(reminder.celery_task_id, terminate=True)
+            reminder.status = ReminderStatus.CANCELLED
+
+        self.db_session.delete(target_event)
+        self.db_session.commit()
+        return True
+
+    def close(self):
+        self.db_session.close()

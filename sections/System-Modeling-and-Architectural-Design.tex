@@ -1,0 +1,78 @@
+\section{System Modeling and Architectural Design}
+
+Before programmatic implementation begins, the structural and behavioral mechanics of the SERS application must be thoroughly conceptualized. Workstream Three is dedicated to translating the textual functional requirements into Unified Modeling Language (UML) abstractions. UML serves as a standardized visual lexicon, allowing the five parallel team members to maintain a unified understanding of the system's architecture, thereby preventing integration conflicts that arise from divergent assumptions. The system is modeled across three distinct UML dimensions: structural mapping, sequential message passing, and state lifecycle transitions.
+
+\subsection{UML Class Diagram}
+
+The static architecture of the system is defined by the UML Class Diagram. This structural diagram represents the object-oriented blueprint of the application, detailing the distinct entities (classes), their internal state encapsulations (attributes), their executable behaviors (methods), and the complex relationships between them.
+
+\begin{table}[h]
+	\centering
+	\caption{UML Class Entities with Attributes, Methods, and Relationships}
+	\label{tab:uml-class-diagram}
+	\renewcommand{\arraystretch}{1.3}
+	\begin{tabular}{|>{\raggedright\arraybackslash}p{0.2\textwidth}|>{\raggedright\arraybackslash}p{0.25\textwidth}|>{\raggedright\arraybackslash}p{0.25\textwidth}|>{\raggedright\arraybackslash}p{0.25\textwidth}|}
+		\hline
+		\textbf{UML Class Entity} & \textbf{Encapsulated Attributes (State)} & \textbf{Executable Methods (Behavior)} & \textbf{Relationship Mapping} \\
+		\hline
+		User Class &
+		\texttt{userID} (UUID), \texttt{username} (String), \texttt{email} (String), \texttt{passwordHash} (String) &
+		\texttt{register()}, \texttt{authenticate()}, \texttt{updateProfile()} &
+		Maintains a one-to-many association with the Event class; a single user can create multiple distinct events. \\
+		\hline
+		Event Class &
+		\texttt{eventID} (UUID), \texttt{title} (String), \texttt{description} (Text), \texttt{eventDateTime} (DateTime), \texttt{location} (String) &
+		\texttt{createEvent()}, \texttt{modifyEvent()}, \texttt{cancelEvent()} &
+		Maintains a one-to-many composition with the Reminder class. If an event is destroyed, its reminders must be destroyed in cascade. \\
+		\hline
+		Reminder Class &
+		\texttt{reminderID} (UUID), \texttt{triggerOffset} (Integer/Minutes), \texttt{status} (Enum: Pending, Dispatched, Failed), \texttt{celeryTaskID} (String) &
+		\texttt{scheduleAlert()}, \texttt{revokeAlert()}, \texttt{logDelivery()} &
+		Subservient to the Event class. Contains the specific background worker ID required to intercept and cancel pending queues. \\
+		\hline
+	\end{tabular}
+\end{table}
+
+\subsection{UML Sequence Diagram}
+
+While the Class Diagram illustrates the static structure, it cannot convey the dynamic execution of processes over time. The UML Sequence Diagram fulfills this requirement by modeling the chronological flow of messages and method invocations between objects during a specific use-case scenario. Sequence diagrams utilize vertical lifelines to represent participating objects and horizontal arrows to represent the exchange of messages. Crucially, sequence diagrams differentiate between synchronous calls (where the sender waits for a return value) and asynchronous signals (where the sender dispatches a message and immediately resumes its own processing).
+
+For the primary scenario of a user creating a new event, the sequence initiates when the external Actor (the User) interacts with the system boundary (the Graphical User Interface). The User submits the populated form data, triggering a synchronous POST request from the Interface to the backend Controller. The Controller receives the payload, executes validation logic, and invokes a synchronous \texttt{save()} method on the Event Model. The Event Model interacts directly with the Database lifeline, persisting the data and returning a unique \texttt{eventID} back to the Controller.
+
+At this juncture, the sequence diverges from standard synchronous operations. The Controller utilizes the newly generated \texttt{eventID} and the user's requested time offset to calculate a precise trigger timestamp. It then fires an asynchronous message—represented by an open arrowhead in UML notation—to the background Task Queue lifeline. Because this is an asynchronous signal, the Controller does not wait for the notification to be sent. It immediately returns a success response up the chain to the Interface, which updates the User's dashboard. Hours or days later, the independent Task Queue lifeline reaches the specified timestamp and dispatches an asynchronous message to the Notification Service to deliver the final alert.
+
+\subsection{UML State Machine Diagram}
+
+The final behavioral model is the UML State Machine Diagram, which tracks the distinct operational conditions (states) a single event entity experiences throughout its lifecycle, driven by specific triggers or events. The state machine is highly relevant for event-driven architectures, as it visualizes how temporal logic governs system behavior.
+
+\begin{table}[h]
+	\centering
+	\caption{Event Lifecycle State Machine with Transitions and Guard Conditions}
+	\label{tab:event-state-machine}
+	\renewcommand{\arraystretch}{1.3}
+	\begin{tabular}{|>{\raggedright\arraybackslash}p{0.2\textwidth}|>{\raggedright\arraybackslash}p{0.35\textwidth}|>{\raggedright\arraybackslash}p{0.4\textwidth}|}
+		\hline
+		\textbf{Lifecycle State} & \textbf{Entering Trigger / Guard Condition} & \textbf{Exiting Transition} \\
+		\hline
+		Created &
+		Initiated when the Controller successfully persists the event payload to the database. The initial entry point. &
+		Automatically transitions to \texttt{Scheduled} once the background worker confirms receipt of the task parameters. \\
+		\hline
+		Scheduled &
+		The event and its associated notification reside in the active background queue, waiting for the temporal condition to be met. &
+		A time-event trigger occurs. The system evaluates the condition: if \texttt{CurrentTime >= CalculatedTriggerTime}. Upon evaluating to true, it transitions to \texttt{Notified}. \\
+		\hline
+		Notified &
+		The execution phase where the external SMTP or SMS service is actively invoked to dispatch the payload to the user. &
+		Automatically transitions to \texttt{Completed} upon successful delivery receipt, or transitions to an \texttt{Error} state if the connection fails. \\
+		\hline
+		Completed &
+		The terminal end-state representing a successfully executed event lifecycle. &
+		None. The event remains in the database for historical logging but is no longer actively processed. \\
+		\hline
+		Cancelled &
+		An explicit manual intervention where the User deletes the event prior to execution. This state can be entered from either \texttt{Created} or \texttt{Scheduled}. &
+		Reaching this state triggers an exit protocol that actively revokes the pending task ID from the asynchronous queue to prevent misfires. \\
+		\hline
+	\end{tabular}
+\end{table}
