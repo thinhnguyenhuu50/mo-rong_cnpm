@@ -3,6 +3,34 @@ Translating the abstract UML models into a functioning codebase requires the sel
 
 However, standard MVC is fundamentally synchronous; a Controller typically blocks the server thread until a task completes. For a reminder system, holding an HTTP connection open for three days until a scheduled event occurs is architecturally catastrophic. Therefore, the technology stack is designed to offload temporal logic. The backend Controller and Model are constructed using Python and the Flask framework. Data is persisted using an SQLite database (capable of scaling to PostgreSQL) mapped via SQLAlchemy. Crucially, the asynchronous layer utilizes Celery as the task queue manager and Redis as the in-memory message broker. When the Flask Controller receives a scheduling request, it pushes the task parameters into the Redis broker and immediately responds to the user. Independent Celery worker processes continuously monitor the Redis broker, executing the tasks only when their specific temporal conditions are met.
 
+
+\begin{figure}
+	\centering
+	\includegraphics[width=0.8\textwidth]{images/high-level_architecture.png}
+	\caption{High-Level Architectural Diagram of the SERS Application}
+	\label{fig:architectural-diagram}
+\end{figure}
+As shown in Figure~\ref{fig:architectural-diagram}, the architecture separates synchronous request handling from asynchronous event execution to keep the system responsive while managing long-delay reminders.
+
+\subsection{Component Roles}
+\begin{itemize}
+	\item \textbf{User Interface (View Layer):} This component represents the frontend graphical interface where users interact with the system to schedule or manage their events.
+	\item \textbf{Flask Web Server (Controller Layer):} This acts as the central orchestrator that receives HTTP requests from the user, validates input logic, and communicates with both the database and the message broker.
+	\item \textbf{SQLite Database (Model Layer):} This component persists the application's core data, maintaining the structure and history of all scheduled events and users.
+	\item \textbf{Redis (Message Broker):} Functions as a temporary, in-memory queue that holds the task parameters and calculated trigger times for upcoming notifications.
+	\item \textbf{Celery (Background Worker):} An independent process that continuously monitors the message broker, executing the notification logic only when the scheduled time arrives.
+	\item \textbf{Notification Service:} The external API or SMTP server responsible for actually delivering the reminder message to the end-user.
+\end{itemize}
+
+\subsection{Data Flow}
+\begin{enumerate}
+	\item \textbf{Synchronous Capture:} The user submits a new event via the interface. The Controller receives this data, invokes the Model to save it in the SQLite database, and retrieves a unique Event ID.
+	\item \textbf{Asynchronous Offload:} The Controller calculates the exact temporal offset for the reminder. Instead of waiting, it pushes a message payload (containing the Event ID and trigger time) into the Redis Message Broker.
+	\item \textbf{Immediate Return:} The Controller immediately returns a success response to the User Interface, freeing up the web server.
+	\item \textbf{Deferred Execution:} The Celery Background Worker listens to the Redis queue. When the time constraint is met, Celery pulls the payload and pushes the data outward to the external Notification Service.
+\end{enumerate}
+
+\subsection{Architectural Fit} This augmented Model-View-Controller (MVC) pattern is specifically chosen because traditional, strictly synchronous MVC cannot handle long-delayed tasks. By separating the architecture into a synchronous "web layer" and an asynchronous "event-driven layer", the application becomes highly scalable and responsive. The web server is never blocked waiting for a timer to expire, which means the user interface remains fast even if there are thousands of scheduled events waiting in the background. Furthermore, if the notification service experiences an outage, the message broker ensures the event tasks are safely queued and not lost.
 \section{Implementation \& Code Quality}
 The theoretical architecture is demonstrated in the following Python implementation snippet, which encapsulates the Controller logic and the Celery background worker.
 
